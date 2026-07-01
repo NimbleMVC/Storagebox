@@ -8,7 +8,11 @@ use NimblePHP\Framework\Attributes\Cron\Cron;
 use NimblePHP\Framework\Cron as CronManager;
 use NimblePHP\Framework\Exception\DatabaseException;
 use NimblePHP\Framework\Exception\NimbleException;
+use NimblePHP\Framework\Kernel;
 use NimblePHP\Framework\Storage;
+use NimblePHP\Storagebox\Event\AfterFileWriteEvent;
+use NimblePHP\Storagebox\Event\BeforeFileDeleteEvent;
+use Random\RandomException;
 use Throwable;
 
 /**
@@ -77,20 +81,24 @@ class ModuleStorageFileModel extends AbstractModel
                 return false;
             }
 
+            $data = [
+                'type' => $type,
+                'file_name' => $fileName,
+                'file_extension' => $fileName ? $this->getExtension($fileName) : null,
+                'hash' => $hash,
+                'provider' => $this->provider->value,
+                'storage_path' => $storageInstance->getFullPath($hash),
+                'size' => strlen($content),
+                'public' => $public ? 1 : 0,
+                'auto_delete' => $autoDelete ? 1 : 0,
+                'date_auto_delete' => $deleteDate,
+                'download_count' => 0
+            ];
+
             try {
-                $this->create([
-                    'type' => $type,
-                    'file_name' => $fileName,
-                    'file_extension' => $fileName ? $this->getExtension($fileName) : null,
-                    'hash' => $hash,
-                    'provider' => $this->provider->value,
-                    'storage_path' => $storageInstance->getFullPath($hash),
-                    'size' => strlen($content),
-                    'public' => $public ? 1 : 0,
-                    'auto_delete' => $autoDelete ? 1 : 0,
-                    'date_auto_delete' => $deleteDate,
-                    'download_count' => 0
-                ]);
+                $this->create($data);
+
+                Kernel::dispatchEvent(new AfterFileWriteEvent($data + ['id' => $this->getId()]));
 
                 return $this->getId();
             } catch (Throwable $throwable) {
@@ -142,20 +150,24 @@ class ModuleStorageFileModel extends AbstractModel
 
             $metadata = $storageInstance->getMetadata($hash);
 
+            $data = [
+                'type' => $type,
+                'file_name' => $fileName ?? basename($path),
+                'file_extension' => $this->getExtension($fileName ?? $path),
+                'hash' => $hash,
+                'provider' => $this->provider->value,
+                'storage_path' => $storageInstance->getFullPath($hash),
+                'size' => $metadata['size'] ?? 0,
+                'public' => $public ? 1 : 0,
+                'auto_delete' => $autoDelete ? 1 : 0,
+                'date_auto_delete' => $deleteDate,
+                'download_count' => 0
+            ];
+
             try {
-                $this->create([
-                    'type' => $type,
-                    'file_name' => $fileName ?? basename($path),
-                    'file_extension' => $this->getExtension($fileName ?? $path),
-                    'hash' => $hash,
-                    'provider' => $this->provider->value,
-                    'storage_path' => $storageInstance->getFullPath($hash),
-                    'size' => $metadata['size'] ?? 0,
-                    'public' => $public ? 1 : 0,
-                    'auto_delete' => $autoDelete ? 1 : 0,
-                    'date_auto_delete' => $deleteDate,
-                    'download_count' => 0
-                ]);
+                $this->create($data);
+
+                Kernel::dispatchEvent(new AfterFileWriteEvent($data + ['id' => $this->getId()]));
 
                 return $this->getId();
             } catch (Throwable $throwable) {
@@ -360,14 +372,18 @@ class ModuleStorageFileModel extends AbstractModel
      */
     public function deleteFile(): void
     {
-        $file = $this->read(['module_storage_file.id' => $this->id], ['module_storage_file.provider', 'module_storage_file.hash']);
+        $file = $this->read(['module_storage_file.id' => $this->id]);
 
         if (!$file) {
             return;
         }
 
-        $this->getStorageInstance(StorageProvider::getByKey($file['module_storage_file']['provider']))
-            ->delete($file['module_storage_file']['hash']);
+        $record = $file['module_storage_file'];
+
+        Kernel::dispatchEvent(new BeforeFileDeleteEvent($record));
+
+        $this->getStorageInstance(StorageProvider::getByKey($record['provider']))
+            ->delete($record['hash']);
 
         $this->delete();
     }
@@ -473,7 +489,7 @@ class ModuleStorageFileModel extends AbstractModel
     /**
      * Generate a unique hash
      * @return string
-     * @throws DatabaseException
+     * @throws RandomException
      */
     private function generateHash(): string
     {
