@@ -118,7 +118,9 @@ class ModuleStorageFileModel extends AbstractModel
     }
 
     /**
-     * Copy a file from a local path
+     * Copy a PHP HTTP upload from its temporary path.
+     *
+     * @deprecated Prefer copyUploadedFile(), which also validates UPLOAD_ERR_OK.
      * @param string $path
      * @param string|null $type
      * @param string|null $fileName
@@ -128,6 +130,7 @@ class ModuleStorageFileModel extends AbstractModel
      * @return false|int
      * @throws DatabaseException
      * @throws NimbleException
+     * @throws StorageBoxException
      */
     public function copy(
         string $path,
@@ -138,13 +141,93 @@ class ModuleStorageFileModel extends AbstractModel
         ?string $deleteDate = null
     ): false|int
     {
+        $uploadedFile = UploadedFile::fromPath($path, $fileName);
+
+        return $this->copyUploadedFile(
+            $uploadedFile,
+            $type,
+            $fileName,
+            $public,
+            $autoDelete,
+            $deleteDate
+        );
+    }
+
+    /**
+     * Store a validated PHP HTTP upload.
+     *
+     * @throws DatabaseException
+     * @throws NimbleException
+     * @throws StorageBoxException
+     */
+    public function copyUploadedFile(
+        UploadedFile $uploadedFile,
+        ?string $type = null,
+        ?string $fileName = null,
+        bool $public = true,
+        bool $autoDelete = false,
+        ?string $deleteDate = null
+    ): false|int {
+        return $this->storeLocalFile(
+            $uploadedFile,
+            $type,
+            $fileName ?? $uploadedFile->getClientFileName(),
+            $public,
+            $autoDelete,
+            $deleteDate
+        );
+    }
+
+    /**
+     * Import a local file explicitly admitted from an application-controlled root.
+     *
+     * @throws DatabaseException
+     * @throws NimbleException
+     * @throws StorageBoxException
+     */
+    public function importTrustedLocalFile(
+        TrustedLocalFile $trustedFile,
+        ?string $type = null,
+        ?string $fileName = null,
+        bool $public = true,
+        bool $autoDelete = false,
+        ?string $deleteDate = null
+    ): false|int {
+        return $this->storeLocalFile(
+            $trustedFile,
+            $type,
+            $fileName ?? $trustedFile->getFileName(),
+            $public,
+            $autoDelete,
+            $deleteDate
+        );
+    }
+
+    /**
+     * @param UploadedFile|TrustedLocalFile $source
+     * @throws DatabaseException
+     * @throws NimbleException
+     * @throws StorageBoxException
+     */
+    private function storeLocalFile(
+        UploadedFile|TrustedLocalFile $source,
+        ?string $type,
+        ?string $fileName,
+        bool $public,
+        bool $autoDelete,
+        ?string $deleteDate
+    ): false|int {
         $storageInstance = $this->getStorageInstance($this->provider);
-        $contentType = MimeType::fromFileName($fileName ?? $path);
+        $contentType = MimeType::fromFileName($fileName);
 
         for ($attempt = 1; $attempt <= self::HASH_RETRY_LIMIT; $attempt++) {
             $hash = $this->generateHash();
 
-            if (!$storageInstance->copy($path, $hash, $contentType)) {
+            $copied = $storageInstance instanceof MinioStorage
+                ? $storageInstance->copyLocalFile($source, $hash, $contentType)
+                : $this->copyLocalSourceToStorage($storageInstance, $source, $hash);
+
+            if (!$copied) {
                 throw new StorageBoxException('Wystąpił błąd podczas kopiowania pliku');
             }
 
@@ -152,8 +235,8 @@ class ModuleStorageFileModel extends AbstractModel
 
             $data = [
                 'type' => $type,
-                'file_name' => $fileName ?? basename($path),
-                'file_extension' => $this->getExtension($fileName ?? $path),
+                'file_name' => $fileName,
+                'file_extension' => $fileName !== null ? $this->getExtension($fileName) : null,
                 'hash' => $hash,
                 'provider' => $this->provider->value,
                 'storage_path' => $storageInstance->getFullPath($hash),
@@ -184,6 +267,40 @@ class ModuleStorageFileModel extends AbstractModel
         }
 
         return false;
+    }
+
+    /**
+     * Stream a validated source into local storage without reopening a raw path.
+     *
+     * @throws StorageBoxException
+     */
+    private function copyLocalSourceToStorage(
+        Storage $storage,
+        UploadedFile|TrustedLocalFile $source,
+        string $destinationPath
+    ): bool {
+        $sourceStream = $source->openStream();
+        $destinationStream = @fopen($storage->getFullPath($destinationPath), 'xb');
+
+        if ($destinationStream === false) {
+            fclose($sourceStream);
+            return false;
+        }
+
+        $copied = false;
+
+        try {
+            $copied = stream_copy_to_stream($sourceStream, $destinationStream) !== false;
+        } finally {
+            fclose($sourceStream);
+            fclose($destinationStream);
+
+            if (!$copied) {
+                $storage->delete($destinationPath);
+            }
+        }
+
+        return $copied;
     }
 
     /**
