@@ -33,6 +33,8 @@ php vendor/bin/nimble migration:run --dir=vendor/nimblephp/storage-box/src/Migra
 ```php
 use NimblePHP\Storagebox\ModuleStorageFileModel;
 use NimblePHP\Storagebox\StorageProvider;
+use NimblePHP\Storagebox\TrustedLocalFile;
+use NimblePHP\Storagebox\UploadedFile;
 
 $model = $this->loadModel(ModuleStorageFileModel::class);
 $model->provider = StorageProvider::minio; // domyślnie StorageProvider::storage
@@ -40,8 +42,13 @@ $model->provider = StorageProvider::minio; // domyślnie StorageProvider::storag
 // zapis z zawartości
 $id = $model->write($content, type: 'avatar', fileName: 'photo.jpg');
 
-// kopiowanie z lokalnej ścieżki
-$id = $model->copy('/tmp/upload.jpg', type: 'attachment', fileName: 'upload.jpg');
+// upload HTTP — fabryka sprawdza UPLOAD_ERR_OK, is_uploaded_file i katalog tymczasowy PHP
+$upload = UploadedFile::fromArray($_FILES['file']);
+$id = $model->copyUploadedFile($upload, type: 'attachment');
+
+// jawnie zaufany import lokalny — plik musi pozostać we wskazanym katalogu
+$source = TrustedLocalFile::fromPath('/srv/app-import/report.pdf', '/srv/app-import');
+$id = $model->importTrustedLocalFile($source, type: 'report');
 
 // pobranie zawartości
 $content = $model->getFileContent($id);
@@ -49,6 +56,12 @@ $content = $model->getFileContent($id);
 // usunięcie
 $model->setId($id)->deleteFile();
 ```
+
+Metoda `copy(string $path, ...)` jest zachowana przejściowo, ale akceptuje wyłącznie
+ścieżki rozpoznane przez `is_uploaded_file()`. Nie należy przekazywać do niej ścieżek
+z requestu. Import zwykłych plików lokalnych wymaga `TrustedLocalFile` i katalogu
+dozwolonego kontrolowanego przez aplikację. Dowiązania symboliczne, urządzenia,
+katalogi oraz ścieżki wychodzące poza ten katalog są odrzucane.
 
 ## Konfiguracja MinIO / S3 (zmienne środowiskowe)
 

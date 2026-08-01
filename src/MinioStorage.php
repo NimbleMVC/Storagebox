@@ -176,6 +176,11 @@ class MinioStorage extends Storage
     }
 
     /**
+     * Copy a PHP HTTP upload to MinIO/S3.
+     *
+     * This compatibility method deliberately does not interpret a missing local
+     * path as an object key. Bucket object keys are not accepted by this API.
+     *
      * @param string $sourcePath
      * @param string $destinationPath
      * @return bool
@@ -183,42 +188,54 @@ class MinioStorage extends Storage
     public function copy(string $sourcePath, string $destinationPath, ?string $contentType = null): bool
     {
         try {
-            if (file_exists($sourcePath)) {
-                return $this->uploadFromLocalFile($sourcePath, $destinationPath, $contentType);
-            }
-
-            Log::log('MinioStorage copy', 'INFO', ['sourcePath' => $sourcePath, 'destinationPath' => $destinationPath]);
-
-            $this->s3Client->copyObject([
-                'Bucket' => $this->bucket,
-                'Key' => $this->buildFullPath($destinationPath),
-                'CopySource' => urlencode($this->bucket . '/' . $this->buildFullPath($sourcePath)),
-            ]);
-
-            return true;
-        } catch (S3Exception $e) {
-            Log::log('MinioStorage copy', 'ERROR', ['exception' => $e->getMessage()]);
-
+            return $this->copyLocalFile(
+                UploadedFile::fromPath($sourcePath),
+                $destinationPath,
+                $contentType
+            );
+        } catch (StorageBoxException $exception) {
+            Log::log('MinioStorage copy', 'WARNING', ['exception' => $exception->getMessage()]);
             return false;
         }
     }
 
     /**
-     * Upload a file from the local filesystem to MinIO
-     * @param string $localPath
+     * Upload a validated local source to MinIO/S3.
+     *
+     * @param UploadedFile|TrustedLocalFile $source
+     * @param string $destinationPath
+     * @param string|null $contentType
+     * @return bool
+     * @throws StorageBoxException
+     */
+    public function copyLocalFile(
+        UploadedFile|TrustedLocalFile $source,
+        string $destinationPath,
+        ?string $contentType = null
+    ): bool {
+        $stream = $source->openStream();
+
+        try {
+            return $this->uploadFromStream($stream, $destinationPath, $contentType);
+        } finally {
+            fclose($stream);
+        }
+    }
+
+    /**
+     * Upload a validated stream to MinIO
+     * @param resource $stream
      * @param string $destinationPath
      * @param string|null $contentType
      * @return bool
      */
-    private function uploadFromLocalFile(string $localPath, string $destinationPath, ?string $contentType = null): bool
+    private function uploadFromStream($stream, string $destinationPath, ?string $contentType = null): bool
     {
         try {
-            Log::log('MinioStorage uploadFromLocalFile', 'INFO', ['localPath' => $localPath, 'destinationPath' => $destinationPath]);
-
             $params = [
                 'Bucket' => $this->bucket,
                 'Key' => $this->buildFullPath($destinationPath),
-                'SourceFile' => $localPath,
+                'Body' => $stream,
             ];
 
             if ($contentType !== null) {
@@ -229,7 +246,7 @@ class MinioStorage extends Storage
 
             return true;
         } catch (S3Exception $e) {
-            Log::log('MinioStorage uploadFromLocalFile', 'ERROR', ['exception' => $e->getMessage()]);
+            Log::log('MinioStorage uploadFromStream', 'ERROR', ['exception' => $e->getMessage()]);
 
             return false;
         }
@@ -358,11 +375,7 @@ class MinioStorage extends Storage
             return false;
         }
 
-        if (file_exists($sourcePath)) {
-            return unlink($sourcePath);
-        }
-
-        return $this->delete($sourcePath);
+        return unlink($sourcePath);
     }
 
     /**
