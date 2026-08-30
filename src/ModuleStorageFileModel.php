@@ -97,10 +97,6 @@ class ModuleStorageFileModel extends AbstractModel
 
             try {
                 $this->create($data);
-
-                Kernel::dispatchEvent(new AfterFileWriteEvent($data + ['id' => $this->getId()]));
-
-                return $this->getId();
             } catch (Throwable $throwable) {
                 $storageInstance->delete($hash);
 
@@ -112,6 +108,12 @@ class ModuleStorageFileModel extends AbstractModel
 
                 return false;
             }
+
+            $id = $this->getId();
+
+            $this->dispatchAfterFileWriteEvent($data + ['id' => $id]);
+
+            return $id;
         }
 
         return false;
@@ -249,10 +251,6 @@ class ModuleStorageFileModel extends AbstractModel
 
             try {
                 $this->create($data);
-
-                Kernel::dispatchEvent(new AfterFileWriteEvent($data + ['id' => $this->getId()]));
-
-                return $this->getId();
             } catch (Throwable $throwable) {
                 $storageInstance->delete($hash);
 
@@ -264,9 +262,35 @@ class ModuleStorageFileModel extends AbstractModel
 
                 return false;
             }
+
+            $id = $this->getId();
+
+            $this->dispatchAfterFileWriteEvent($data + ['id' => $id]);
+
+            return $id;
         }
 
         return false;
+    }
+
+    /**
+     * Dispatch AfterFileWriteEvent without letting a listener failure undo an
+     * already-persisted file+record (STB-H04): the write already succeeded at
+     * this point, so a listener exception must not trigger the create()-failure
+     * rollback path (which would delete the object but leave the DB record).
+     * @param array $eventData
+     * @return void
+     */
+    private function dispatchAfterFileWriteEvent(array $eventData): void
+    {
+        try {
+            Kernel::dispatchEvent(new AfterFileWriteEvent($eventData));
+        } catch (Throwable $throwable) {
+            $this->log('AfterFileWriteEvent listener error', 'ERR', [
+                'exception' => $throwable->getMessage(),
+                'id' => $eventData['id'] ?? null
+            ]);
+        }
     }
 
     /**
@@ -482,27 +506,42 @@ class ModuleStorageFileModel extends AbstractModel
     }
 
     /**
-     * Delete the file (storage + database) for the current id
-     * @return void
+     * Delete the file (storage + database) for the current id.
+     *
+     * The database record is only removed once the storage object has actually
+     * been deleted (STB-H05): if the object delete fails, the record is kept so
+     * a subsequent deleteCron()/manual retry can attempt it again instead of
+     * silently leaving an orphaned, possibly still-public object with no
+     * remaining trace in the database.
+     * @return bool true if the record no longer exists afterwards (deleted now, or was already gone)
      * @throws DatabaseException
      * @throws NimbleException
      */
-    public function deleteFile(): void
+    public function deleteFile(): bool
     {
         $file = $this->read(['module_storage_file.id' => $this->id]);
 
         if (!$file) {
-            return;
+            return true;
         }
 
         $record = $file['module_storage_file'];
 
         Kernel::dispatchEvent(new BeforeFileDeleteEvent($record));
 
-        $this->getStorageInstance(StorageProvider::getByKey($record['provider']))
+        $deleted = $this->getStorageInstance(StorageProvider::getByKey($record['provider']))
             ->delete($record['hash']);
 
-        $this->delete();
+        if (!$deleted) {
+            $this->log('File delete error: object not removed, keeping database record', 'ERR', [
+                'id' => $this->id,
+                'hash' => $record['hash']
+            ]);
+
+            return false;
+        }
+
+        return $this->delete();
     }
 
     /**
