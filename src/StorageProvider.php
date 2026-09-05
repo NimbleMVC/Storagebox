@@ -9,6 +9,8 @@ enum StorageProvider: string
 
     case minio = 'minio';
 
+    case mirrored = 'mirrored';
+
     /**
      * Get the provider by key
      * @param string|null $key

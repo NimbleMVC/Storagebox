@@ -225,7 +225,7 @@ class ModuleStorageFileModel extends AbstractModel
         for ($attempt = 1; $attempt <= self::HASH_RETRY_LIMIT; $attempt++) {
             $hash = $this->generateHash();
 
-            $copied = $storageInstance instanceof MinioStorage
+            $copied = $storageInstance instanceof StreamableStorageInterface
                 ? $storageInstance->copyLocalFile($source, $hash, $contentType)
                 : $this->copyLocalSourceToStorage($storageInstance, $source, $hash);
 
@@ -610,6 +610,7 @@ class ModuleStorageFileModel extends AbstractModel
     {
         return match ($provider) {
             StorageProvider::minio => new MinioStorage($this->directory),
+            StorageProvider::mirrored => new MirroredStorage($this->directory),
             default => new Storage($this->directory),
         };
     }

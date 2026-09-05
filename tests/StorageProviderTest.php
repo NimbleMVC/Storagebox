@@ -12,6 +12,7 @@ class StorageProviderTest extends TestCase
     {
         $this->assertSame(StorageProvider::storage, StorageProvider::getByKey('storage'));
         $this->assertSame(StorageProvider::minio, StorageProvider::getByKey('minio'));
+        $this->assertSame(StorageProvider::mirrored, StorageProvider::getByKey('mirrored'));
     }
 
     public function testGetByKeyFallsBackToStorage(): void
@@ -26,6 +27,7 @@ class StorageProviderTest extends TestCase
     {
         $this->assertSame('storage', StorageProvider::storage->value);
         $this->assertSame('minio', StorageProvider::minio->value);
+        $this->assertSame('mirrored', StorageProvider::mirrored->value);
     }
 
 }

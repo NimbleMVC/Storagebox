@@ -9,9 +9,11 @@ driver (lokalny system plików lub MinIO/S3) i przechowuje ich metadane w bazie 
 - `Module` — rejestracja modułu i uruchamianie migracji (`onUpdate`)
 - `ModuleStorageFileModel` — manager plików (zapis, kopiowanie, pobieranie, duplikacja, usuwanie, auto-usuwanie)
 - `MinioStorage` — driver MinIO / AWS S3 (rozszerza `NimblePHP\Framework\Storage`)
-- `StorageProvider` — enum providerów (`storage`, `minio`)
+- `MirroredStorage` — driver wielo-backendowy z failoverem i tłem synchronizacji (patrz niżej)
+- `ModuleStorageBackendModel` / `ModuleStorageFileMirrorModel` — konfiguracja backendów i stan mirroringu dla `MirroredStorage`
+- `StorageProvider` — enum providerów (`storage`, `minio`, `mirrored`)
 - `StorageBoxException` — wyjątek modułu
-- `src/Migrations/` — migracja tworząca tabelę `module_storage_file`
+- `src/Migrations/` — migracje tworzące tabele `module_storage_file`, `module_storage_backend`, `module_storage_file_mirror`
 
 ## Instalacja
 
@@ -70,3 +72,49 @@ katalogi oraz ścieżki wychodzące poza ten katalog są odrzucane.
 - `MINIO_REGION`
 - `MINIO_USERNAME`
 - `MINIO_PASSWORD`
+
+## Mirrored storage — wiele backendów z failoverem (opcjonalne)
+
+`StorageProvider::mirrored` to opcjonalna alternatywa dla pojedynczego providera:
+lista backendów (MinIO, S3, lokalny filesystem) konfigurowana w bazie danych,
+z priorytetami i automatycznym failoverem. Zapis idzie synchronicznie na
+najwyżej priorytetowy zdrowy backend, pozostałe backendy są dosynchronizowywane
+w tle przez cron (`ModuleStorageFileMirrorModel::reconcileCron()`), a zdrowie
+backendów jest cyklicznie sprawdzane (`ModuleStorageBackendModel::healthCheckCron()`).
+Istniejące pliki zapisane przez `storage`/`minio` nie są tym w żaden sposób
+dotknięte — to w pełni opcjonalna ścieżka, włączana per plik przez ustawienie
+`$model->provider = StorageProvider::mirrored`.
+
+```php
+use NimblePHP\Storagebox\ModuleStorageBackendModel;
+
+$backends = $this->loadModel(ModuleStorageBackendModel::class);
+
+// MinIO, najwyższy priorytet
+$backends->createBackend(
+    name: 'minio-primary',
+    type: 'minio',
+    priority: 1000,
+    config: ['host' => 'https://minio.local:9000', 'bucket' => 'files'],
+    credentials: ['username' => 'access-key', 'password' => 'secret-key']
+);
+
+// AWS S3 jako backup (puste "host" = tryb AWS S3, region wykrywany automatycznie)
+$backends->createBackend(
+    name: 's3-backup',
+    type: 'minio',
+    priority: 500,
+    config: ['bucket' => 'files-backup'],
+    credentials: ['username' => 'AKIA...', 'password' => '...']
+);
+
+// lokalny filesystem jako tryb awaryjny
+$backends->createBackend(name: 'local-fallback', type: 'storage', priority: 0);
+```
+
+Wrażliwe dane logowania (`credentials`) są szyfrowane w bazie przez
+`nimblephp/crypto` (`Crypto::encryptArray()`, AES-256-GCM) i nigdy nie są
+zapisywane jawnie — wymaga to skonfigurowanego `ENCRYPTION_KEY_CURRENT` /
+`ENCRYPTION_KEY_N` oraz zarejestrowanego modułu Crypto w aplikacji, ale tylko
+w momencie faktycznego użycia tej funkcji (instalacja paczki sama w sobie
+niczego nie szyfruje ani nie wymaga kluczy).
