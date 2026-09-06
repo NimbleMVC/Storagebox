@@ -54,6 +54,7 @@ class MirroredStorageTest extends TestCase
                 name VARCHAR(100) NOT NULL UNIQUE,
                 type VARCHAR(20) DEFAULT 'minio',
                 priority INTEGER DEFAULT 0,
+                role VARCHAR(20) DEFAULT 'primary',
                 status VARCHAR(10) DEFAULT 'up',
                 last_checked_at DATETIME,
                 config TEXT,
@@ -193,16 +194,72 @@ class MirroredStorageTest extends TestCase
         $this->assertSame([], $this->mirrorModel()->getStatusForFile('hash1'), 'untracked fallback write must not queue mirror rows');
     }
 
+    public function testFailoverBackendDoesNotReceiveProactiveMirrorCopies(): void
+    {
+        $this->registerBackend('primary-a', 1000, 'a');
+        $this->registerBackend('primary-b', 500, 'b');
+        $this->registerBackend('emergency', 0, 'c', 'failover');
+
+        (new MirroredStorage('files'))->put('hash1', 'hello world');
+
+        $this->assertSame('hello world', file_get_contents($this->projectPath . '/storage/a/hash1'));
+        $this->assertFileDoesNotExist($this->projectPath . '/storage/c/hash1');
+
+        $statuses = $this->indexByBackendName($this->mirrorModel()->getStatusForFile('hash1'));
+        $this->assertSame('synced', $statuses['primary-a']['status']);
+        $this->assertSame('pending', $statuses['primary-b']['status']);
+        $this->assertArrayNotHasKey('emergency', $statuses, 'a failover backend must never get a proactive mirror row');
+    }
+
+    public function testWriteFallsBackToFailoverBackendWhenAllPrimariesAreDown(): void
+    {
+        $primaryId = $this->registerBackend('primary-a', 1000, 'a');
+        $this->backendModel()->markDown($primaryId);
+        $this->registerBackend('emergency', 0, 'c', 'failover');
+
+        (new MirroredStorage('files'))->put('hash1', 'hello world');
+
+        $this->assertFileDoesNotExist($this->projectPath . '/storage/a/hash1');
+        $this->assertSame('hello world', file_get_contents($this->projectPath . '/storage/c/hash1'));
+
+        $statuses = $this->indexByBackendName($this->mirrorModel()->getStatusForFile('hash1'));
+        $this->assertSame('synced', $statuses['emergency']['status']);
+        $this->assertCount(1, $statuses, 'no pending rows should be queued when the write landed on a failover backend');
+    }
+
+    public function testDrainCronMovesFileFromFailoverBackendOntoPrimaryOnceHealthy(): void
+    {
+        $primaryId = $this->registerBackend('primary-a', 1000, 'a');
+        $this->backendModel()->markDown($primaryId);
+        $this->registerBackend('emergency', 0, 'c', 'failover');
+
+        (new MirroredStorage('files'))->put('hash1', 'hello world');
+        $this->assertSame('hello world', file_get_contents($this->projectPath . '/storage/c/hash1'));
+
+        // The primary recovers (e.g. picked up by healthCheckCron()).
+        $this->backendModel()->markUp($primaryId);
+
+        $this->mirrorModel()->drainCron();
+
+        $this->assertSame('hello world', file_get_contents($this->projectPath . '/storage/a/hash1'));
+        $this->assertFileDoesNotExist($this->projectPath . '/storage/c/hash1', 'drainCron() must remove the file from the failover backend once it is safely on a primary');
+
+        $statuses = $this->indexByBackendName($this->mirrorModel()->getStatusForFile('hash1'));
+        $this->assertSame('synced', $statuses['primary-a']['status']);
+        $this->assertArrayNotHasKey('emergency', $statuses, 'the failover mirror row must be dropped once drained');
+    }
+
     /**
      * @param string $name
      * @param int $priority
      * @param string $directory
+     * @param string $role
      * @return int
      */
-    private function registerBackend(string $name, int $priority, string $directory): int
+    private function registerBackend(string $name, int $priority, string $directory, string $role = 'primary'): int
     {
         $model = $this->backendModel();
-        $model->createBackend($name, 'storage', $priority, ['directory' => $directory]);
+        $model->createBackend($name, 'storage', $priority, ['directory' => $directory], [], $role);
 
         return $model->getId();
     }

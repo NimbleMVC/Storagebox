@@ -40,9 +40,13 @@ class ModuleStorageBackendModel extends AbstractModel
      *
      * @param string $name Unique backend identifier, also used as the encryption context.
      * @param string $type StorageProvider value, e.g. 'minio' or 'storage'.
-     * @param int $priority Higher is tried first.
+     * @param int $priority Higher is tried first (within the same role).
      * @param array $config Non-secret settings, stored as plain JSON.
      * @param array $credentials Sensitive settings (e.g. access key/secret), encrypted before storage.
+     * @param string $role 'primary' (normal write/mirror target) or 'failover' - a 'failover'
+     *                     backend never receives a proactive mirrored copy; it is only written
+     *                     to when every 'primary' backend is unavailable, and drained back onto
+     *                     a 'primary' once one recovers (ModuleStorageFileMirrorModel::drainCron()).
      * @return bool
      * @throws DatabaseException
      * @throws JsonException
@@ -52,12 +56,14 @@ class ModuleStorageBackendModel extends AbstractModel
         string $type,
         int $priority = 0,
         array $config = [],
-        array $credentials = []
+        array $credentials = [],
+        string $role = 'primary'
     ): bool {
         return $this->create([
             'name' => $name,
             'type' => $type,
             'priority' => $priority,
+            'role' => $role,
             'status' => 'up',
             'config' => json_encode($config, JSON_THROW_ON_ERROR),
             'credentials' => $credentials !== [] ? Crypto::encryptArray($credentials, $this->credentialsContext($name)) : null,
@@ -74,6 +80,28 @@ class ModuleStorageBackendModel extends AbstractModel
     {
         $rows = $this->readAll(
             ['module_storage_backend.enabled' => 1, 'module_storage_backend.status' => 'up'],
+            null,
+            'module_storage_backend.priority DESC'
+        );
+
+        return array_column($rows, 'module_storage_backend');
+    }
+
+    /**
+     * Enabled, healthy backends of a given role ('primary' or 'failover'), ordered
+     * from highest to lowest priority.
+     * @param string $role
+     * @return array
+     * @throws DatabaseException
+     */
+    public function getActiveByRole(string $role): array
+    {
+        $rows = $this->readAll(
+            [
+                'module_storage_backend.enabled' => 1,
+                'module_storage_backend.status' => 'up',
+                'module_storage_backend.role' => $role
+            ],
             null,
             'module_storage_backend.priority DESC'
         );

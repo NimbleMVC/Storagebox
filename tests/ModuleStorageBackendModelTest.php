@@ -50,6 +50,7 @@ class ModuleStorageBackendModelTest extends TestCase
                 name VARCHAR(100) NOT NULL UNIQUE,
                 type VARCHAR(20) DEFAULT 'minio',
                 priority INTEGER DEFAULT 0,
+                role VARCHAR(20) DEFAULT 'primary',
                 status VARCHAR(10) DEFAULT 'up',
                 last_checked_at DATETIME,
                 config TEXT,
@@ -117,6 +118,28 @@ class ModuleStorageBackendModelTest extends TestCase
         $active = $this->createModel()->getActiveOrderedByPriority();
 
         $this->assertSame(['minio-primary', 's3-secondary'], array_column($active, 'name'));
+    }
+
+    public function testGetActiveByRoleFiltersOutTheOtherRole(): void
+    {
+        $primaryModel = $this->createModel();
+        $primaryModel->createBackend(name: 'primary-minio', type: 'minio', priority: 1000, role: 'primary');
+
+        $failoverModel = $this->createModel();
+        $failoverModel->createBackend(name: 'emergency-local', type: 'storage', priority: 0, role: 'failover');
+
+        $this->assertSame(['primary-minio'], array_column($this->createModel()->getActiveByRole('primary'), 'name'));
+        $this->assertSame(['emergency-local'], array_column($this->createModel()->getActiveByRole('failover'), 'name'));
+    }
+
+    public function testCreateBackendDefaultsToPrimaryRole(): void
+    {
+        $model = $this->createModel();
+        $model->createBackend(name: 'default-role', type: 'storage', priority: 0);
+
+        $row = $this->createModel()->getById($model->getId());
+
+        $this->assertSame('primary', $row['role']);
     }
 
     private function createModel(): ModuleStorageBackendModel

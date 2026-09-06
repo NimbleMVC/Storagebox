@@ -29,10 +29,24 @@ class MirroredStorage extends Storage implements StreamableStorageInterface
     private ModuleStorageFileMirrorModel $mirrorModel;
 
     /**
-     * Lazily-loaded, priority-ordered list of enabled+healthy backends.
+     * Lazily-loaded, priority-ordered list of enabled+healthy backends (any role).
      * @var array|null
      */
     private ?array $activeBackends = null;
+
+    /**
+     * Lazily-loaded, priority-ordered list of enabled+healthy role='primary' backends -
+     * the normal write/mirror targets.
+     * @var array|null
+     */
+    private ?array $primaryBackends = null;
+
+    /**
+     * Lazily-loaded, priority-ordered list of enabled+healthy role='failover' backends -
+     * only written to when every primary backend is unavailable, see put()/copyLocalFile().
+     * @var array|null
+     */
+    private ?array $failoverBackends = null;
 
     public function __construct(string $directory, bool $securePath = true)
     {
@@ -99,6 +113,40 @@ class MirroredStorage extends Storage implements StreamableStorageInterface
     }
 
     /**
+     * @return array
+     */
+    private function primaryBackends(): array
+    {
+        if ($this->primaryBackends === null) {
+            try {
+                $this->primaryBackends = $this->backendModel->getActiveByRole('primary');
+            } catch (Throwable $exception) {
+                Log::log('MirroredStorage primaryBackends', 'ERROR', ['exception' => $exception->getMessage()]);
+                $this->primaryBackends = [];
+            }
+        }
+
+        return $this->primaryBackends;
+    }
+
+    /**
+     * @return array
+     */
+    private function failoverBackends(): array
+    {
+        if ($this->failoverBackends === null) {
+            try {
+                $this->failoverBackends = $this->backendModel->getActiveByRole('failover');
+            } catch (Throwable $exception) {
+                Log::log('MirroredStorage failoverBackends', 'ERROR', ['exception' => $exception->getMessage()]);
+                $this->failoverBackends = [];
+            }
+        }
+
+        return $this->failoverBackends;
+    }
+
+    /**
      * Backends worth trying to read a file from: those the mirror table records as
      * holding a synced copy, in priority order. Falls back to every active backend
      * when nothing is tracked yet (e.g. a file written before mirroring was enabled,
@@ -132,22 +180,34 @@ class MirroredStorage extends Storage implements StreamableStorageInterface
     }
 
     /**
-     * Record which backend now definitely holds the file (synced) and which
-     * others should still receive a copy (pending, picked up by reconcileCron()).
+     * Record which backend now definitely holds the file (synced) and, only when
+     * that backend was a 'primary' one, which other 'primary' backends should
+     * still receive a copy (pending, picked up by reconcileCron()).
+     *
+     * A 'failover' backend never gets this proactive fan-out: it is an emergency
+     * landing spot, not a normal mirror target. Once a 'primary' backend is
+     * healthy again, ModuleStorageFileMirrorModel::drainCron() moves the file
+     * from the failover backend onto it and removes it from the failover backend.
      * @param string $filePath
-     * @param int $primaryBackendId
+     * @param int $successBackendId
+     * @param bool $wasPrimary
      * @return void
      */
-    private function recordMirrorState(string $filePath, int $primaryBackendId): void
+    private function recordMirrorState(string $filePath, int $successBackendId, bool $wasPrimary): void
     {
         try {
-            foreach ($this->activeBackends() as $backend) {
-                $this->mirrorModel->queue(
-                    $filePath,
-                    $this->directory,
-                    (int)$backend['id'],
-                    (int)$backend['id'] === $primaryBackendId ? 'synced' : 'pending'
-                );
+            $this->mirrorModel->queue($filePath, $this->directory, $successBackendId, 'synced');
+
+            if (!$wasPrimary) {
+                return;
+            }
+
+            foreach ($this->primaryBackends() as $backend) {
+                if ((int)$backend['id'] === $successBackendId) {
+                    continue;
+                }
+
+                $this->mirrorModel->queue($filePath, $this->directory, (int)$backend['id'], 'pending');
             }
         } catch (Throwable $exception) {
             Log::log('MirroredStorage recordMirrorState', 'ERROR', ['exception' => $exception->getMessage()]);
@@ -162,26 +222,46 @@ class MirroredStorage extends Storage implements StreamableStorageInterface
      */
     public function put(string $filePath, string $content, ?string $contentType = null): true
     {
-        $primary = null;
+        $backend = $this->writeContentToFirstHealthyBackend($this->primaryBackends(), $filePath, $content, $contentType);
 
-        foreach ($this->activeBackends() as $backend) {
+        if ($backend !== null) {
+            $this->recordMirrorState($filePath, (int)$backend['id'], true);
+
+            return true;
+        }
+
+        $backend = $this->writeContentToFirstHealthyBackend($this->failoverBackends(), $filePath, $content, $contentType);
+
+        if ($backend !== null) {
+            $this->recordMirrorState($filePath, (int)$backend['id'], false);
+
+            return true;
+        }
+
+        parent::put($filePath, $content);
+
+        return true;
+    }
+
+    /**
+     * Try each backend in order, marking it down and moving on when it fails.
+     * @param array $backends
+     * @param string $filePath
+     * @param string $content
+     * @param string|null $contentType
+     * @return array|null the backend record that accepted the write, or null if none did
+     */
+    private function writeContentToFirstHealthyBackend(array $backends, string $filePath, string $content, ?string $contentType): ?array
+    {
+        foreach ($backends as $backend) {
             if ($this->writeContentToBackend($backend, $filePath, $content, $contentType)) {
-                $primary = $backend;
-                break;
+                return $backend;
             }
 
             $this->backendModel->markDown((int)$backend['id']);
         }
 
-        if ($primary === null) {
-            parent::put($filePath, $content);
-
-            return true;
-        }
-
-        $this->recordMirrorState($filePath, (int)$primary['id']);
-
-        return true;
+        return null;
     }
 
     /**
@@ -221,24 +301,48 @@ class MirroredStorage extends Storage implements StreamableStorageInterface
         string $destinationPath,
         ?string $contentType = null
     ): bool {
-        $primary = null;
+        $backend = $this->writeSourceToFirstHealthyBackend($this->primaryBackends(), $source, $destinationPath, $contentType);
 
-        foreach ($this->activeBackends() as $backend) {
+        if ($backend !== null) {
+            $this->recordMirrorState($destinationPath, (int)$backend['id'], true);
+
+            return true;
+        }
+
+        $backend = $this->writeSourceToFirstHealthyBackend($this->failoverBackends(), $source, $destinationPath, $contentType);
+
+        if ($backend !== null) {
+            $this->recordMirrorState($destinationPath, (int)$backend['id'], false);
+
+            return true;
+        }
+
+        return $this->copyLocalSourceToLocalFallback($source, $destinationPath);
+    }
+
+    /**
+     * Try each backend in order, marking it down and moving on when it fails.
+     * @param array $backends
+     * @param UploadedFile|TrustedLocalFile $source
+     * @param string $destinationPath
+     * @param string|null $contentType
+     * @return array|null the backend record that accepted the write, or null if none did
+     */
+    private function writeSourceToFirstHealthyBackend(
+        array $backends,
+        UploadedFile|TrustedLocalFile $source,
+        string $destinationPath,
+        ?string $contentType
+    ): ?array {
+        foreach ($backends as $backend) {
             if ($this->writeSourceToBackend($backend, $source, $destinationPath, $contentType)) {
-                $primary = $backend;
-                break;
+                return $backend;
             }
 
             $this->backendModel->markDown((int)$backend['id']);
         }
 
-        if ($primary === null) {
-            return $this->copyLocalSourceToLocalFallback($source, $destinationPath);
-        }
-
-        $this->recordMirrorState($destinationPath, (int)$primary['id']);
-
-        return true;
+        return null;
     }
 
     /**

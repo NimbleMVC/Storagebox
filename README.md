@@ -108,9 +108,19 @@ $backends->createBackend(
     credentials: ['username' => 'AKIA...', 'password' => '...']
 );
 
-// lokalny filesystem jako tryb awaryjny
-$backends->createBackend(name: 'local-fallback', type: 'storage', priority: 0);
+// lokalny filesystem jako tryb awaryjny, WYŁĄCZNIE na wypadek gdy oba powyższe padną
+// (role: 'failover' - nigdy nie dostaje proaktywnej kopii, patrz niżej)
+$backends->createBackend(name: 'local-fallback', type: 'storage', priority: 0, role: 'failover');
 ```
+
+### Rola backendu: `primary` vs `failover`
+
+Każdy backend ma `role`: `primary` (domyślna) albo `failover`.
+
+- **`primary`** — normalny cel mirroringu: zapis idzie na najwyżej priorytetowy zdrowy `primary`, a pozostałe `primary` backendy dostają kopię w tle (`reconcileCron()`).
+- **`failover`** — backend awaryjny: **nigdy** nie dostaje proaktywnej kopii przy zwykłym zapisie. Jest używany tylko wtedy, gdy *żaden* backend `primary` nie zadziałał. Gdy jakiś `primary` wróci do zdrowia, `ModuleStorageFileMirrorModel::drainCron()` przenosi plik z backendu `failover` z powrotem na `primary` i usuwa go z backendu `failover`.
+
+To odpowiada na scenariusz "MinIO + S3 jako primary, lokalny dysk tylko jako awaryjny tryb, bez ciągłego trzymania tam kopii wszystkiego" — bez roli `failover`, lokalny dysk (jak każdy inny aktywny backend) dostawałby kopię każdego zapisanego pliku.
 
 Wrażliwe dane logowania (`credentials`) są szyfrowane w bazie przez
 `nimblephp/crypto` (`Crypto::encryptArray()`, AES-256-GCM) i nigdy nie są

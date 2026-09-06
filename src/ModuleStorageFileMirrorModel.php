@@ -124,6 +124,38 @@ class ModuleStorageFileMirrorModel extends AbstractModel
     }
 
     /**
+     * Synced mirror rows sitting on a specific backend (used by drainCron() to find
+     * files parked on a 'failover' backend), oldest first.
+     * @param int $backendId
+     * @param int $limit
+     * @return array
+     * @throws DatabaseException
+     */
+    public function getSyncedForBackend(int $backendId, int $limit = 100): array
+    {
+        $rows = $this->readAll(
+            ['module_storage_file_mirror.status' => 'synced', 'module_storage_file_mirror.backend_id' => $backendId],
+            null,
+            'module_storage_file_mirror.id ASC',
+            (string)$limit
+        );
+
+        return array_column($rows, 'module_storage_file_mirror');
+    }
+
+    /**
+     * Remove a single mirror row by id (as opposed to deleteForFile(), which removes
+     * every row for a file across all backends).
+     * @param int $id
+     * @return bool
+     * @throws DatabaseException
+     */
+    public function deleteById(int $id): bool
+    {
+        return $this->setId($id)->delete();
+    }
+
+    /**
      * Maximum number of mirror rows processed by a single reconcileCron() run.
      * @var int
      */
@@ -199,6 +231,101 @@ class ModuleStorageFileMirrorModel extends AbstractModel
         }
 
         return null;
+    }
+
+    /**
+     * Maximum number of mirror rows processed by a single drainCron() run.
+     * @var int
+     */
+    private const int DRAIN_BATCH_LIMIT = 100;
+
+    /**
+     * Move files parked on a 'failover' backend back onto a 'primary' backend once
+     * one is healthy again. A 'failover' backend never receives a proactive mirror
+     * copy (see MirroredStorage::recordMirrorState()) - it only ever holds a file
+     * because every 'primary' backend was unavailable at write time - so this is
+     * the only path that gets such a file back onto normal, mirrored storage.
+     * @return void
+     * @throws DatabaseException
+     */
+    #[Cron('* * * * *', CronManager::PRIORITY_MINIMUM)]
+    public function drainCron(): void
+    {
+        $backendModel = ModuleStorageBackendModel::make();
+        $failoverBackends = $backendModel->getActiveByRole('failover');
+
+        if ($failoverBackends === []) {
+            return;
+        }
+
+        $primaryBackends = $backendModel->getActiveByRole('primary');
+
+        if ($primaryBackends === []) {
+            return;
+        }
+
+        $targetBackend = $primaryBackends[0];
+
+        foreach ($failoverBackends as $failoverBackend) {
+            foreach ($this->getSyncedForBackend((int)$failoverBackend['id'], self::DRAIN_BATCH_LIMIT) as $mirror) {
+                $this->drainOne($mirror, $failoverBackend, $targetBackend, $backendModel);
+            }
+        }
+    }
+
+    /**
+     * @param array $mirror
+     * @param array $failoverBackend
+     * @param array $targetBackend
+     * @param ModuleStorageBackendModel $backendModel
+     * @return void
+     * @throws DatabaseException
+     */
+    private function drainOne(array $mirror, array $failoverBackend, array $targetBackend, ModuleStorageBackendModel $backendModel): void
+    {
+        try {
+            $failoverStorage = MirroredStorage::buildStorageForBackendRecord($failoverBackend, $mirror['directory'], $backendModel);
+            $content = $failoverStorage->get($mirror['file_hash']);
+        } catch (Throwable) {
+            return;
+        }
+
+        if ($content === null) {
+            // Object already gone from the failover backend (e.g. deleted meanwhile
+            // via MirroredStorage::delete()) - nothing left to drain, drop the stale row.
+            $this->deleteById((int)$mirror['id']);
+
+            return;
+        }
+
+        try {
+            MirroredStorage::buildStorageForBackendRecord($targetBackend, $mirror['directory'], $backendModel)
+                ->put($mirror['file_hash'], $content);
+        } catch (Throwable) {
+            $backendModel->markDown((int)$targetBackend['id']);
+
+            return;
+        }
+
+        $this->queue($mirror['file_hash'], $mirror['directory'], (int)$targetBackend['id'], 'synced');
+
+        $removedFromFailover = false;
+
+        try {
+            $removedFromFailover = !$failoverStorage->exists($mirror['file_hash']) || $failoverStorage->delete($mirror['file_hash']);
+        } catch (Throwable) {
+            $removedFromFailover = false;
+        }
+
+        if (!$removedFromFailover) {
+            // The file now safely exists on both the failover and the target backend;
+            // leave this row in place so the next run retries removing it from the
+            // failover backend, matching the "never lose track" rule used everywhere
+            // else in this package (STB-4/STB-5).
+            return;
+        }
+
+        $this->deleteById((int)$mirror['id']);
     }
 
 }
