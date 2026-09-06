@@ -124,24 +124,30 @@ To odpowiada na scenariusz "MinIO + S3 jako primary, lokalny dysk tylko jako awa
 
 ### Dodanie backendu do już działającego systemu (backfill)
 
-Nowy backend **nie** dostaje automatycznie kopii plików zapisanych przed jego dodaniem —
-`reconcileCron()`/`drainCron()` przetwarzają tylko wiersze już istniejące w
-`module_storage_file_mirror`. Żeby dociągnąć istniejące pliki na nowo dodany backend:
+Dodanie nowego (albo ponowne włączenie istniejącego) backendu `primary` jest w pełni
+automatyczne — `ModuleStorageFileMirrorModel::backfillCron()` (co minutę) sam wykrywa
+każdy włączony backend `primary` i dogania go o pliki, których jeszcze nie ma, kolejkując
+je jako `pending`; `reconcileCron()` (ten sam przebieg albo kolejny) faktycznie je kopiuje.
+Nie trzeba nic wywoływać ręcznie — wystarczy `createBackend(...)` albo ustawienie `enabled = 1`.
+
+```php
+$backends->createBackend(name: 's3-new', type: 'minio', priority: 750, config: [...], credentials: [...]);
+// nic więcej - w ciągu ~minuty backfillCron() + reconcileCron() dogonią ten backend same
+```
+
+Backendy `role: 'failover'` są świadomie pomijane przez `backfillCron()` (mają trzymać
+tylko to, czego naprawdę nigdzie indziej nie ma, nie pełną kopię wszystkiego) — jeśli
+mimo to chcesz z góry zasilić backend `failover`, zrób to jawnie:
 
 ```php
 use NimblePHP\Storagebox\ModuleStorageFileMirrorModel;
 
-$newBackendId = $backends->createBackend(name: 's3-new', type: 'minio', priority: 750, ...)
-    ? $backends->getId()
-    : null;
-
 $mirrors = $this->loadModel(ModuleStorageFileMirrorModel::class);
-$queued = $mirrors->backfillToBackend($newBackendId); // kolejkuje wszystkie znane pliki jako "pending"
-// reconcileCron() dosynchronizuje je w tle, tak jak każdy inny "pending" wpis
+$queued = $mirrors->backfillToBackend($failoverBackendId); // kolejkuje wszystkie znane pliki jako "pending"
 ```
 
-Wywołanie jest idempotentne — pliki już zakolejkowane/zsynchronizowane na tym backendzie
-są pomijane, więc można je bezpiecznie odpalić wielokrotnie.
+`backfillToBackend()` jest idempotentne — pliki już zakolejkowane/zsynchronizowane na danym
+backendzie są pomijane, więc zarówno cron, jak i ręczne wywołanie można bezpiecznie powtarzać.
 
 Wrażliwe dane logowania (`credentials`) są szyfrowane w bazie przez
 `nimblephp/crypto` (`Crypto::encryptArray()`, AES-256-GCM) i nigdy nie są

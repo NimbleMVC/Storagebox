@@ -331,6 +331,36 @@ class MirroredStorageTest extends TestCase
         $this->assertSame(0, $this->mirrorModel()->backfillToBackend($newBackendId));
     }
 
+    public function testBackfillCronAutomaticallyPicksUpANewlyAddedPrimaryBackendWithoutManualBackfill(): void
+    {
+        $this->registerBackend('primary-a', 1000, 'a');
+        (new MirroredStorage('files'))->put('hash1', 'hello world');
+
+        // Admin adds a second primary later - no call to backfillToBackend() here.
+        $this->registerBackend('primary-b', 500, 'b');
+
+        $this->mirrorModel()->backfillCron();
+        $this->mirrorModel()->reconcileCron();
+
+        $this->assertSame('hello world', file_get_contents($this->projectPath . '/storage/b/hash1'));
+
+        $statuses = $this->indexByBackendName($this->mirrorModel()->getStatusForFile('hash1'));
+        $this->assertSame('synced', $statuses['primary-b']['status']);
+    }
+
+    public function testBackfillCronSkipsFailoverBackends(): void
+    {
+        $this->registerBackend('primary-a', 1000, 'a');
+        (new MirroredStorage('files'))->put('hash1', 'hello world');
+
+        $this->registerBackend('emergency', 0, 'c', 'failover');
+
+        $this->mirrorModel()->backfillCron();
+
+        $statuses = $this->indexByBackendName($this->mirrorModel()->getStatusForFile('hash1'));
+        $this->assertArrayNotHasKey('emergency', $statuses, 'backfillCron() must not proactively seed a failover backend');
+    }
+
     /**
      * @param string $name
      * @param int $priority

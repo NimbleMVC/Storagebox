@@ -179,15 +179,15 @@ class ModuleStorageFileMirrorModel extends AbstractModel
      * Queue every currently-known mirrored file onto a backend as 'pending', so
      * reconcileCron() picks them up in the background.
      *
-     * Adding a backend to module_storage_backend does NOT do this automatically -
      * MirroredStorage only ever queues a file for the backends that existed at the
-     * moment that file was written (see MirroredStorage::recordMirrorState()), it
-     * never retroactively revisits files written before a backend existed. Call
-     * this once after registering a new backend if you want it backfilled with
-     * everything already known to mirroring, e.g.:
-     *
-     *   $backends->createBackend(name: 's3-new', type: 'minio', priority: 750, ...);
-     *   $mirrors->backfillToBackend($backends->getId());
+     * moment that file was written (see MirroredStorage::recordMirrorState()) - it
+     * never retroactively revisits files written before a backend existed. This is
+     * what closes that gap. It runs automatically, every minute, for every enabled
+     * 'primary' backend via backfillCron() below - a newly added (or re-enabled)
+     * backend gets caught up within a minute without any manual step. It stays
+     * public so it can also be called directly for an immediate, on-demand backfill
+     * instead of waiting for the next cron tick, and so it can be pointed at a
+     * 'failover' backend too, which backfillCron() deliberately skips (see there).
      *
      * "Currently-known mirrored file" means any (file_hash, directory) pair that
      * appears in this table for at least one other backend - files written through
@@ -235,6 +235,31 @@ class ModuleStorageFileMirrorModel extends AbstractModel
         );
 
         return array_column($rows, 'module_storage_file_mirror');
+    }
+
+    /**
+     * Automatically backfill every enabled 'primary' backend with any file it is
+     * still missing. Runs before reconcileCron() in the same tick so a newly added
+     * backend's backfilled rows get a chance to be reconciled immediately, not a
+     * minute later. 'failover' backends are deliberately excluded - they are meant
+     * to hold only what genuinely could not go anywhere else (see MirroredStorage),
+     * not a full proactive copy of everything; use backfillToBackend() directly if
+     * you really want to pre-seed one.
+     * @return void
+     * @throws DatabaseException
+     */
+    #[Cron('* * * * *', CronManager::PRIORITY_MINIMUM)]
+    public function backfillCron(): void
+    {
+        $backendModel = ModuleStorageBackendModel::make();
+
+        foreach ($backendModel->getAllEnabledOrderedByPriority() as $backend) {
+            if ($backend['role'] !== 'primary') {
+                continue;
+            }
+
+            $this->backfillToBackend((int)$backend['id']);
+        }
     }
 
     /**
