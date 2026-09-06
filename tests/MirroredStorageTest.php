@@ -77,7 +77,8 @@ class MirroredStorageTest extends TestCase
                 last_attempt_at DATETIME,
                 last_error TEXT,
                 date_created DATETIME,
-                date_modify DATETIME
+                date_modify DATETIME,
+                UNIQUE (file_hash, backend_id)
             )
             SQL
         );
@@ -247,6 +248,87 @@ class MirroredStorageTest extends TestCase
         $statuses = $this->indexByBackendName($this->mirrorModel()->getStatusForFile('hash1'));
         $this->assertSame('synced', $statuses['primary-a']['status']);
         $this->assertArrayNotHasKey('emergency', $statuses, 'the failover mirror row must be dropped once drained');
+    }
+
+    public function testDrainCronDeletesRedundantCopyWhenBackendIsReclassifiedToFailover(): void
+    {
+        // "primary-a" starts out as a normal primary, gets a full proactive mirror
+        // copy like any other primary, and is only reclassified to 'failover' later
+        // (an admin decision, not something that happens through MirroredStorage).
+        $primaryAId = $this->registerBackend('primary-a', 1000, 'a');
+        $this->registerBackend('primary-b', 500, 'b');
+
+        (new MirroredStorage('files'))->put('hash1', 'hello world');
+        $this->mirrorModel()->reconcileCron();
+
+        $this->assertFileExists($this->projectPath . '/storage/a/hash1');
+        $this->assertFileExists($this->projectPath . '/storage/b/hash1');
+
+        $this->backendModel()->setId($primaryAId)->update(['role' => 'failover']);
+
+        $this->mirrorModel()->drainCron();
+
+        $this->assertFileDoesNotExist($this->projectPath . '/storage/a/hash1', 'a redundant copy on a newly-failover backend must be deleted, not re-copied');
+        $this->assertFileExists($this->projectPath . '/storage/b/hash1', 'the untouched primary copy must be left alone');
+
+        $statuses = $this->indexByBackendName($this->mirrorModel()->getStatusForFile('hash1'));
+        $this->assertArrayNotHasKey('primary-a', $statuses, 'the now-failover backend must lose its mirror row');
+        $this->assertSame('synced', $statuses['primary-b']['status']);
+        $this->assertCount(1, $statuses);
+    }
+
+    public function testDrainCronDoesNotCrashWhenTargetBackendAlreadyHasAPendingRowForTheFile(): void
+    {
+        // "primary-b" already has a *pending* (not yet synced) mirror row for hash1
+        // from the original fan-out, because reconcileCron() has not run yet. If
+        // "primary-a" (the one that actually holds the synced copy) is reclassified
+        // to 'failover' before that reconciliation happens, drainCron() ends up
+        // targeting "primary-b" too - queue() must update that existing row instead
+        // of colliding with its (file_hash, backend_id) unique key.
+        $primaryAId = $this->registerBackend('primary-a', 1000, 'a');
+        $this->registerBackend('primary-b', 500, 'b');
+
+        (new MirroredStorage('files'))->put('hash1', 'hello world');
+        // Deliberately do NOT run reconcileCron() - primary-b stays "pending".
+
+        $this->backendModel()->setId($primaryAId)->update(['role' => 'failover']);
+
+        $this->mirrorModel()->drainCron();
+
+        $this->assertFileDoesNotExist($this->projectPath . '/storage/a/hash1');
+        $this->assertSame('hello world', file_get_contents($this->projectPath . '/storage/b/hash1'));
+
+        $statuses = $this->mirrorModel()->getStatusForFile('hash1');
+        $this->assertCount(1, $statuses, 'the pre-existing pending row must be updated in place, not duplicated');
+        $this->assertSame('synced', $statuses[0]['status']);
+    }
+
+    public function testBackfillToBackendQueuesEveryKnownFileOnceForANewBackend(): void
+    {
+        $this->registerBackend('primary-a', 1000, 'a');
+
+        (new MirroredStorage('files'))->put('hash1', 'file one');
+        (new MirroredStorage('files'))->put('hash2', 'file two');
+
+        // A brand-new backend, added after both files already existed.
+        $newBackendId = $this->registerBackend('primary-b', 500, 'b');
+
+        $queued = $this->mirrorModel()->backfillToBackend($newBackendId);
+        $this->assertSame(2, $queued);
+
+        $statusesHash1 = $this->indexByBackendName($this->mirrorModel()->getStatusForFile('hash1'));
+        $statusesHash2 = $this->indexByBackendName($this->mirrorModel()->getStatusForFile('hash2'));
+        $this->assertSame('pending', $statusesHash1['primary-b']['status']);
+        $this->assertSame('pending', $statusesHash2['primary-b']['status']);
+
+        // reconcileCron() then picks the backfilled rows up like any other pending mirror.
+        $this->mirrorModel()->reconcileCron();
+
+        $this->assertSame('file one', file_get_contents($this->projectPath . '/storage/b/hash1'));
+        $this->assertSame('file two', file_get_contents($this->projectPath . '/storage/b/hash2'));
+
+        // Calling it again must not re-queue (and not duplicate) already-handled files.
+        $this->assertSame(0, $this->mirrorModel()->backfillToBackend($newBackendId));
     }
 
     /**

@@ -34,7 +34,11 @@ class ModuleStorageFileMirrorModel extends AbstractModel
     }
 
     /**
-     * Register that a file needs to exist on a given backend.
+     * Register that a file needs to exist on a given backend. Upserts: a (file_hash,
+     * backend_id) pair is unique, and re-queuing an existing pair (e.g. drainCron()
+     * targeting a backend that already holds a pending/synced row for this file from
+     * an earlier fan-out) must update that row in place rather than violate the
+     * unique key by inserting a duplicate.
      * @param string $fileHash
      * @param string $directory
      * @param int $backendId
@@ -44,6 +48,22 @@ class ModuleStorageFileMirrorModel extends AbstractModel
      */
     public function queue(string $fileHash, string $directory, int $backendId, string $status = 'pending'): bool
     {
+        $existing = $this->readAll([
+            'module_storage_file_mirror.file_hash' => $fileHash,
+            'module_storage_file_mirror.backend_id' => $backendId
+        ]);
+
+        if ($existing !== []) {
+            $row = $existing[0]['module_storage_file_mirror'];
+
+            return $this->setId((int)$row['id'])->update([
+                'directory' => $directory,
+                'status' => $status,
+                'last_attempt_at' => date('Y-m-d H:i:s'),
+                'last_error' => null
+            ]);
+        }
+
         return $this->create([
             'file_hash' => $fileHash,
             'directory' => $directory,
@@ -153,6 +173,68 @@ class ModuleStorageFileMirrorModel extends AbstractModel
     public function deleteById(int $id): bool
     {
         return $this->setId($id)->delete();
+    }
+
+    /**
+     * Queue every currently-known mirrored file onto a backend as 'pending', so
+     * reconcileCron() picks them up in the background.
+     *
+     * Adding a backend to module_storage_backend does NOT do this automatically -
+     * MirroredStorage only ever queues a file for the backends that existed at the
+     * moment that file was written (see MirroredStorage::recordMirrorState()), it
+     * never retroactively revisits files written before a backend existed. Call
+     * this once after registering a new backend if you want it backfilled with
+     * everything already known to mirroring, e.g.:
+     *
+     *   $backends->createBackend(name: 's3-new', type: 'minio', priority: 750, ...);
+     *   $mirrors->backfillToBackend($backends->getId());
+     *
+     * "Currently-known mirrored file" means any (file_hash, directory) pair that
+     * appears in this table for at least one other backend - files written through
+     * a plain 'storage'/'minio' provider (never mirrored) are not touched.
+     * @param int $backendId
+     * @return int number of files newly queued (files already queued/synced on this backend are left untouched)
+     * @throws DatabaseException
+     */
+    public function backfillToBackend(int $backendId): int
+    {
+        $alreadyQueued = array_column(
+            $this->readAll(['module_storage_file_mirror.backend_id' => $backendId], ['module_storage_file_mirror.file_hash']),
+            'module_storage_file_mirror'
+        );
+        $alreadyQueuedHashes = array_column($alreadyQueued, 'file_hash');
+
+        $queued = 0;
+
+        foreach ($this->getDistinctFiles() as $file) {
+            if (in_array($file['file_hash'], $alreadyQueuedHashes, true)) {
+                continue;
+            }
+
+            $this->queue($file['file_hash'], $file['directory'], $backendId, 'pending');
+            $queued++;
+        }
+
+        return $queued;
+    }
+
+    /**
+     * Every distinct (file_hash, directory) pair known to mirroring, regardless of
+     * which backend(s) it currently sits on.
+     * @return array
+     * @throws DatabaseException
+     */
+    private function getDistinctFiles(): array
+    {
+        $rows = $this->readAll(
+            null,
+            ['module_storage_file_mirror.file_hash', 'module_storage_file_mirror.directory'],
+            null,
+            null,
+            'module_storage_file_mirror.file_hash, module_storage_file_mirror.directory'
+        );
+
+        return array_column($rows, 'module_storage_file_mirror');
     }
 
     /**
@@ -283,6 +365,17 @@ class ModuleStorageFileMirrorModel extends AbstractModel
      */
     private function drainOne(array $mirror, array $failoverBackend, array $targetBackend, ModuleStorageBackendModel $backendModel): void
     {
+        // A backend can be reclassified from 'primary' to 'failover' while it still
+        // holds a full set of previously-mirrored files. Those are not "stranded" -
+        // they are already safe on whatever healthy backend synced them before the
+        // reclassification - so there is nothing to drain: just drop the now-redundant
+        // copy sitting on this backend instead of needlessly re-copying it elsewhere.
+        if ($this->hasHealthySyncedCopyElsewhere($mirror, $backendModel)) {
+            $this->removeFromFailoverBackend($mirror, $failoverBackend, $backendModel);
+
+            return;
+        }
+
         try {
             $failoverStorage = MirroredStorage::buildStorageForBackendRecord($failoverBackend, $mirror['directory'], $backendModel);
             $content = $failoverStorage->get($mirror['file_hash']);
@@ -309,23 +402,54 @@ class ModuleStorageFileMirrorModel extends AbstractModel
 
         $this->queue($mirror['file_hash'], $mirror['directory'], (int)$targetBackend['id'], 'synced');
 
-        $removedFromFailover = false;
+        $this->removeFromFailoverBackend($mirror, $failoverBackend, $backendModel);
+    }
 
+    /**
+     * Whether some backend OTHER than the one in $mirror already has a confirmed
+     * ('synced') and currently reachable (enabled+up) copy of this file.
+     * @param array $mirror
+     * @param ModuleStorageBackendModel $backendModel
+     * @return bool
+     */
+    private function hasHealthySyncedCopyElsewhere(array $mirror, ModuleStorageBackendModel $backendModel): bool
+    {
+        foreach ($this->getStatusForFile($mirror['file_hash']) as $candidate) {
+            if ($candidate['status'] !== 'synced' || (int)$candidate['id'] === (int)$mirror['id']) {
+                continue;
+            }
+
+            $candidateBackend = $backendModel->getById((int)$candidate['backend_id']);
+
+            if ($candidateBackend !== null && (bool)$candidateBackend['enabled'] && $candidateBackend['status'] === 'up') {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Remove the object from a backend and, only once that is confirmed, drop its
+     * mirror row - never lose track of an object that could still physically exist.
+     * @param array $mirror
+     * @param array $backend
+     * @param ModuleStorageBackendModel $backendModel
+     * @return void
+     * @throws DatabaseException
+     */
+    private function removeFromFailoverBackend(array $mirror, array $backend, ModuleStorageBackendModel $backendModel): void
+    {
         try {
-            $removedFromFailover = !$failoverStorage->exists($mirror['file_hash']) || $failoverStorage->delete($mirror['file_hash']);
+            $storage = MirroredStorage::buildStorageForBackendRecord($backend, $mirror['directory'], $backendModel);
+            $removed = !$storage->exists($mirror['file_hash']) || $storage->delete($mirror['file_hash']);
         } catch (Throwable) {
-            $removedFromFailover = false;
+            $removed = false;
         }
 
-        if (!$removedFromFailover) {
-            // The file now safely exists on both the failover and the target backend;
-            // leave this row in place so the next run retries removing it from the
-            // failover backend, matching the "never lose track" rule used everywhere
-            // else in this package (STB-4/STB-5).
-            return;
+        if ($removed) {
+            $this->deleteById((int)$mirror['id']);
         }
-
-        $this->deleteById((int)$mirror['id']);
     }
 
 }

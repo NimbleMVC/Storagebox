@@ -213,7 +213,7 @@ class ModuleStorageBackendModel extends AbstractModel
      * @throws DatabaseException
      * @throws JsonException
      */
-    #[Cron('*/5 * * * *', CronManager::PRIORITY_MINIMUM)]
+    #[Cron('* * * * *', CronManager::PRIORITY_MINIMUM)]
     public function healthCheckCron(): void
     {
         foreach ($this->getAllEnabledOrderedByPriority() as $backend) {

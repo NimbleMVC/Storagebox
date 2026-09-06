@@ -122,6 +122,27 @@ Każdy backend ma `role`: `primary` (domyślna) albo `failover`.
 
 To odpowiada na scenariusz "MinIO + S3 jako primary, lokalny dysk tylko jako awaryjny tryb, bez ciągłego trzymania tam kopii wszystkiego" — bez roli `failover`, lokalny dysk (jak każdy inny aktywny backend) dostawałby kopię każdego zapisanego pliku.
 
+### Dodanie backendu do już działającego systemu (backfill)
+
+Nowy backend **nie** dostaje automatycznie kopii plików zapisanych przed jego dodaniem —
+`reconcileCron()`/`drainCron()` przetwarzają tylko wiersze już istniejące w
+`module_storage_file_mirror`. Żeby dociągnąć istniejące pliki na nowo dodany backend:
+
+```php
+use NimblePHP\Storagebox\ModuleStorageFileMirrorModel;
+
+$newBackendId = $backends->createBackend(name: 's3-new', type: 'minio', priority: 750, ...)
+    ? $backends->getId()
+    : null;
+
+$mirrors = $this->loadModel(ModuleStorageFileMirrorModel::class);
+$queued = $mirrors->backfillToBackend($newBackendId); // kolejkuje wszystkie znane pliki jako "pending"
+// reconcileCron() dosynchronizuje je w tle, tak jak każdy inny "pending" wpis
+```
+
+Wywołanie jest idempotentne — pliki już zakolejkowane/zsynchronizowane na tym backendzie
+są pomijane, więc można je bezpiecznie odpalić wielokrotnie.
+
 Wrażliwe dane logowania (`credentials`) są szyfrowane w bazie przez
 `nimblephp/crypto` (`Crypto::encryptArray()`, AES-256-GCM) i nigdy nie są
 zapisywane jawnie — wymaga to skonfigurowanego `ENCRYPTION_KEY_CURRENT` /
