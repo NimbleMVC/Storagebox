@@ -149,6 +149,38 @@ $queued = $mirrors->backfillToBackend($failoverBackendId); // kolejkuje wszystki
 `backfillToBackend()` jest idempotentne — pliki już zakolejkowane/zsynchronizowane na danym
 backendzie są pomijane, więc zarówno cron, jak i ręczne wywołanie można bezpiecznie powtarzać.
 
+### Migracja istniejących plików na mirrored (`storage`/`minio` → `mirrored`)
+
+Pliki zapisane wcześniej przez zwykły `storage`/`minio` (przed włączeniem mirrored storage)
+można "przełączyć" na `mirrored` bez przenoszenia czy ponownego wgrywania — wystarczy,
+że backend w `module_storage_backend` opisuje **to samo** miejsce, w którym plik już
+fizycznie jest (te same dane logowania/bucket dla MinIO):
+
+```php
+use NimblePHP\Storagebox\ModuleStorageBackendModel;
+use NimblePHP\Storagebox\ModuleStorageFileModel;
+use NimblePHP\Storagebox\StorageProvider;
+
+$backends = $this->loadModel(ModuleStorageBackendModel::class);
+$backends->createBackend(
+    name: 'existing-minio',
+    type: 'minio',
+    priority: 1000,
+    config: ['host' => $_ENV['MINIO_HOST'], 'bucket' => $_ENV['MINIO_BUCKET'], 'region' => $_ENV['MINIO_REGION']],
+    credentials: ['username' => $_ENV['MINIO_USERNAME'], 'password' => $_ENV['MINIO_PASSWORD']]
+);
+
+$model = $this->loadModel(ModuleStorageFileModel::class);
+$migrated = $model->migrateToMirrored($backends->getId(), StorageProvider::minio);
+// $migrated = liczba zmigrowanych rekordów; wywołaj ponownie, jeśli masz ich więcej niż limit (domyślnie 500)
+```
+
+Metoda tylko rejestruje wpis mirrora ze statusem `synced` i przełącza kolumnę `provider`
+na `mirrored` — nie dotyka samego pliku ani nie weryfikuje, że backend faktycznie go widzi
+(brak sprawdzenia analogicznie do reszty pakietu, który też nie wymusza kluczy obcych).
+Po migracji dodanie kolejnych backendów `primary` działa już w pełni automatycznie
+(`backfillCron()`, patrz wyżej).
+
 Wrażliwe dane logowania (`credentials`) są szyfrowane w bazie przez
 `nimblephp/crypto` (`Crypto::encryptArray()`, AES-256-GCM) i nigdy nie są
 zapisywane jawnie — wymaga to skonfigurowanego `ENCRYPTION_KEY_CURRENT` /
