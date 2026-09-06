@@ -6,14 +6,16 @@ use krzysztofzylka\DatabaseManager\Exception\ConnectException;
 use krzysztofzylka\DatabaseManager\Exception\DatabaseManagerException;
 use NimblePHP\Framework\Exception\DatabaseException;
 use NimblePHP\Framework\Exception\NimbleException;
+use NimblePHP\Framework\Interfaces\CliCommandProviderInterface;
 use NimblePHP\Framework\Kernel;
 use NimblePHP\Framework\Module\Interfaces\ModuleInterface;
 use NimblePHP\Framework\Module\Interfaces\ModuleUpdateInterface;
 use NimblePHP\Migrations\Exceptions\MigrationException;
 use NimblePHP\Migrations\Migrations;
+use NimblePHP\Storagebox\CLI\Commands\AddBackendCommand;
 use Throwable;
 
-class Module implements ModuleInterface, ModuleUpdateInterface
+class Module implements ModuleInterface, ModuleUpdateInterface, CliCommandProviderInterface
 {
 
     public function getName(): string
@@ -23,6 +25,16 @@ class Module implements ModuleInterface, ModuleUpdateInterface
 
     public function register(): void
     {
+    }
+
+    /**
+     * @return array
+     */
+    public function getCliCommands(): array
+    {
+        return [
+            AddBackendCommand::class,
+        ];
     }
 
     /**

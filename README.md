@@ -14,6 +14,8 @@ driver (lokalny system plików lub MinIO/S3) i przechowuje ich metadane w bazie 
 - `StorageProvider` — enum providerów (`storage`, `minio`, `mirrored`)
 - `StorageBoxException` — wyjątek modułu
 - `src/Migrations/` — migracje tworzące tabele `module_storage_file`, `module_storage_backend`, `module_storage_file_mirror`
+- `storage:add-backend` — komenda CLI (`php vendor/bin/nimble storage:add-backend ...`) dodająca backend bez wpisywania kluczy w kodzie (patrz niżej)
+- `Event\BackendMarkedDownEvent` / `Event\BackendMarkedUpEvent` / `Event\MirrorSyncFailedEvent` — eventy obserwowalności mirroringu (patrz niżej)
 
 ## Instalacja
 
@@ -113,6 +115,30 @@ $backends->createBackend(
 $backends->createBackend(name: 'local-fallback', type: 'storage', priority: 0, role: 'failover');
 ```
 
+### Dodawanie backendu bez wpisywania kluczy w kodzie (CLI)
+
+Wołanie `createBackend()` z poziomu kodu aplikacji oznacza, że dane logowania muszą
+gdzieś w tym kodzie (albo w migracji/seederze) się fizycznie znaleźć — a to zwykle
+ląduje w repo. Zamiast tego można użyć komendy CLI, która **nigdy nie przyjmuje
+sekretu jako zwykłej wartości** — tylko z już ustawionej zmiennej środowiskowej
+(`--username-env`/`--password-env`) albo pytając interaktywnie z ukrytym echem:
+
+```bash
+php vendor/bin/nimble storage:add-backend minio-primary \
+    --priority=1000 \
+    --host=https://minio.local:9000 \
+    --bucket=files \
+    --username-env=MINIO_USERNAME \
+    --password-env=MINIO_PASSWORD
+
+php vendor/bin/nimble storage:add-backend local-emergency --type=storage --role=failover --priority=0
+```
+
+`--username-env`/`--password-env` wskazują **nazwę** zmiennej środowiskowej (np. już
+załadowanej z `.env`), nie sam sekret — więc żaden klucz nie trafia do argumentów
+procesu ani do historii powłoki. Bez tych opcji komenda zapyta o dane logowania
+interaktywnie (bez wyświetlania wpisywanych znaków).
+
 ### Rola backendu: `primary` vs `failover`
 
 Każdy backend ma `role`: `primary` (domyślna) albo `failover`.
@@ -187,3 +213,35 @@ zapisywane jawnie — wymaga to skonfigurowanego `ENCRYPTION_KEY_CURRENT` /
 `ENCRYPTION_KEY_N` oraz zarejestrowanego modułu Crypto w aplikacji, ale tylko
 w momencie faktycznego użycia tej funkcji (instalacja paczki sama w sobie
 niczego nie szyfruje ani nie wymaga kluczy).
+
+### Eventy mirroringu (obserwowalność)
+
+Backend padający/wracający i trwałe niepowodzenia synchronizacji dispatchują eventy
+przez `Kernel::dispatchEvent(...)` — bez żadnej wbudowanej logiki alarmowania; to,
+co z nimi zrobisz (log, powiadomienie, metryka), zależy w całości od Ciebie:
+
+```php
+use NimblePHP\Storagebox\Event\BackendMarkedDownEvent;
+use NimblePHP\Storagebox\Event\BackendMarkedUpEvent;
+use NimblePHP\Storagebox\Event\MirrorSyncFailedEvent;
+
+Kernel::getEventDispatcher()->addListener(BackendMarkedDownEvent::class, function (BackendMarkedDownEvent $event) {
+    // $event->backend - pełny rekord z module_storage_backend (już ze statusem 'down')
+    Slack::alert("Backend storage \"{$event->backend['name']}\" padł");
+});
+
+Kernel::getEventDispatcher()->addListener(MirrorSyncFailedEvent::class, function (MirrorSyncFailedEvent $event) {
+    // $event->mirror - rekord z module_storage_file_mirror, $event->error - komunikat błędu
+    // Dispatchowany przy KAŻDEJ nieudanej próbie (reconcileCron/drainCron) - jeśli chcesz
+    // throttling (np. alarm dopiero po 5 kolejnych niepowodzeniach tego samego pliku),
+    // policz to sam w swoim listenerze.
+});
+```
+
+- `BackendMarkedDownEvent`/`BackendMarkedUpEvent` — dispatchowane tylko przy **faktycznej
+  zmianie** statusu backendu (`markUp()`/`markDown()` w `ModuleStorageBackendModel`) —
+  powtarzające się nieudane zapisy na już martwy backend nie zasypią Cię eventami.
+- `MirrorSyncFailedEvent` — dispatchowany przy każdym `markFailed()` w `ModuleStorageFileMirrorModel`.
+
+Błąd rzucony w listenerze jest tylko logowany i nie wpływa na resztę operacji
+(analogicznie do `AfterFileWriteEvent`/`BeforeFileDeleteEvent`).

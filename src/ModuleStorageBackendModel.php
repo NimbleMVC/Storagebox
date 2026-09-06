@@ -8,6 +8,9 @@ use NimblePHP\Framework\Abstracts\AbstractModel;
 use NimblePHP\Framework\Attributes\Cron\Cron;
 use NimblePHP\Framework\Cron as CronManager;
 use NimblePHP\Framework\Exception\DatabaseException;
+use NimblePHP\Framework\Kernel;
+use NimblePHP\Storagebox\Event\BackendMarkedDownEvent;
+use NimblePHP\Storagebox\Event\BackendMarkedUpEvent;
 use Throwable;
 
 /**
@@ -139,25 +142,73 @@ class ModuleStorageBackendModel extends AbstractModel
     }
 
     /**
-     * Mark a backend as reachable.
+     * Mark a backend as reachable. Dispatches BackendMarkedUpEvent, but only when the
+     * backend was not already 'up' (repeated calls while already up are silent no-ops
+     * event-wise, e.g. healthCheckCron() checks this itself, but MirroredStorage/
+     * reconcileCron()/drainCron() call markDown() unconditionally on every failure -
+     * this method is where the "did it actually change" check lives, so every caller
+     * gets a correct, non-spammy event regardless of whether it pre-checked).
      * @param int $id
      * @return bool
      * @throws DatabaseException
      */
     public function markUp(int $id): bool
     {
-        return $this->setId($id)->update(['status' => 'up', 'last_checked_at' => date('Y-m-d H:i:s')]);
+        return $this->changeStatus($id, 'up');
     }
 
     /**
-     * Mark a backend as unreachable.
+     * Mark a backend as unreachable. See markUp() for the event-dispatch rule.
      * @param int $id
      * @return bool
      * @throws DatabaseException
      */
     public function markDown(int $id): bool
     {
-        return $this->setId($id)->update(['status' => 'down', 'last_checked_at' => date('Y-m-d H:i:s')]);
+        return $this->changeStatus($id, 'down');
+    }
+
+    /**
+     * @param int $id
+     * @param string $status 'up' or 'down'
+     * @return bool
+     * @throws DatabaseException
+     */
+    private function changeStatus(int $id, string $status): bool
+    {
+        $before = $this->getById($id);
+
+        $updated = $this->setId($id)->update(['status' => $status, 'last_checked_at' => date('Y-m-d H:i:s')]);
+
+        if ($updated && $before !== null && $before['status'] !== $status) {
+            $this->dispatchStatusChangedEvent($before, $status);
+        }
+
+        return $updated;
+    }
+
+    /**
+     * @param array $before The backend record as it was before this status change.
+     * @param string $newStatus
+     * @return void
+     */
+    private function dispatchStatusChangedEvent(array $before, string $newStatus): void
+    {
+        $record = $before;
+        $record['status'] = $newStatus;
+        $record['last_checked_at'] = date('Y-m-d H:i:s');
+
+        $event = $newStatus === 'up' ? new BackendMarkedUpEvent($record) : new BackendMarkedDownEvent($record);
+
+        try {
+            Kernel::dispatchEvent($event);
+        } catch (Throwable $exception) {
+            $this->log('Backend status event listener error', 'ERR', [
+                'exception' => $exception->getMessage(),
+                'backend' => $record['name'] ?? $record['id'] ?? null,
+                'status' => $newStatus
+            ]);
+        }
     }
 
     /**

@@ -9,6 +9,9 @@ use NimblePHP\Framework\Config;
 use NimblePHP\Framework\Event\EventDispatcher;
 use NimblePHP\Framework\Kernel;
 use NimblePHP\Framework\Middleware\MiddlewareManager;
+use NimblePHP\Storagebox\Event\BackendMarkedDownEvent;
+use NimblePHP\Storagebox\Event\BackendMarkedUpEvent;
+use NimblePHP\Storagebox\Event\MirrorSyncFailedEvent;
 use NimblePHP\Storagebox\ModuleStorageBackendModel;
 use NimblePHP\Storagebox\ModuleStorageFileMirrorModel;
 use NimblePHP\Storagebox\MirroredStorage;
@@ -359,6 +362,62 @@ class MirroredStorageTest extends TestCase
 
         $statuses = $this->indexByBackendName($this->mirrorModel()->getStatusForFile('hash1'));
         $this->assertArrayNotHasKey('emergency', $statuses, 'backfillCron() must not proactively seed a failover backend');
+    }
+
+    public function testMarkDownAndMarkUpDispatchEventsOnlyOnActualTransition(): void
+    {
+        $id = $this->registerBackend('primary-a', 1000, 'a');
+
+        $downEvents = [];
+        $upEvents = [];
+        Kernel::getEventDispatcher()->addListener(BackendMarkedDownEvent::class, function (BackendMarkedDownEvent $event) use (&$downEvents): void {
+            $downEvents[] = $event->backend;
+        });
+        Kernel::getEventDispatcher()->addListener(BackendMarkedUpEvent::class, function (BackendMarkedUpEvent $event) use (&$upEvents): void {
+            $upEvents[] = $event->backend;
+        });
+
+        $this->backendModel()->markDown($id);
+        $this->assertCount(1, $downEvents);
+        $this->assertSame('primary-a', $downEvents[0]['name']);
+        $this->assertSame('down', $downEvents[0]['status']);
+
+        // Already down - a redundant markDown() (e.g. another failed write attempt)
+        // must not fire a second event.
+        $this->backendModel()->markDown($id);
+        $this->assertCount(1, $downEvents);
+
+        $this->backendModel()->markUp($id);
+        $this->assertCount(1, $upEvents);
+        $this->assertSame('up', $upEvents[0]['status']);
+
+        // Already up - no redundant event here either.
+        $this->backendModel()->markUp($id);
+        $this->assertCount(1, $upEvents);
+    }
+
+    public function testMarkFailedDispatchesMirrorSyncFailedEvent(): void
+    {
+        $backendId = $this->registerBackend('primary-a', 1000, 'a');
+        $mirrorModel = $this->mirrorModel();
+        $mirrorModel->queue('hash1', 'files', $backendId, 'pending');
+        $mirrorRow = $mirrorModel->getStatusForFile('hash1')[0];
+
+        $captured = [];
+        Kernel::getEventDispatcher()->addListener(MirrorSyncFailedEvent::class, function (MirrorSyncFailedEvent $event) use (&$captured): void {
+            $captured[] = $event;
+        });
+
+        $mirrorModel->markFailed((int)$mirrorRow['id'], 'no healthy source');
+
+        $this->assertCount(1, $captured);
+        $this->assertSame('no healthy source', $captured[0]->error);
+        $this->assertSame('hash1', $captured[0]->mirror['file_hash']);
+        $this->assertSame('failed', $captured[0]->mirror['status']);
+
+        // Every failure dispatches again - no built-in throttling.
+        $mirrorModel->markFailed((int)$mirrorRow['id'], 'still failing');
+        $this->assertCount(2, $captured);
     }
 
     /**

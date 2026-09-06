@@ -6,6 +6,8 @@ use NimblePHP\Framework\Abstracts\AbstractModel;
 use NimblePHP\Framework\Attributes\Cron\Cron;
 use NimblePHP\Framework\Cron as CronManager;
 use NimblePHP\Framework\Exception\DatabaseException;
+use NimblePHP\Framework\Kernel;
+use NimblePHP\Storagebox\Event\MirrorSyncFailedEvent;
 use Throwable;
 
 /**
@@ -118,6 +120,8 @@ class ModuleStorageFileMirrorModel extends AbstractModel
     }
 
     /**
+     * Mark a mirror row as failed and dispatch MirrorSyncFailedEvent - on every call,
+     * not just the first one for a given file/backend (see the event's own docblock).
      * @param int $id
      * @param string $error
      * @return bool
@@ -125,11 +129,54 @@ class ModuleStorageFileMirrorModel extends AbstractModel
      */
     public function markFailed(int $id, string $error): bool
     {
-        return $this->setId($id)->update([
+        $updated = $this->setId($id)->update([
             'status' => 'failed',
             'last_attempt_at' => date('Y-m-d H:i:s'),
             'last_error' => $error
         ]);
+
+        if ($updated) {
+            $this->dispatchSyncFailedEvent($id, $error);
+        }
+
+        return $updated;
+    }
+
+    /**
+     * @param int $id
+     * @param string $error
+     * @return void
+     * @throws DatabaseException
+     */
+    private function dispatchSyncFailedEvent(int $id, string $error): void
+    {
+        $mirror = $this->getById($id);
+
+        if ($mirror === null) {
+            return;
+        }
+
+        try {
+            Kernel::dispatchEvent(new MirrorSyncFailedEvent($mirror, $error));
+        } catch (Throwable $exception) {
+            $this->log('MirrorSyncFailedEvent listener error', 'ERR', [
+                'exception' => $exception->getMessage(),
+                'file_hash' => $mirror['file_hash'] ?? null,
+                'backend_id' => $mirror['backend_id'] ?? null
+            ]);
+        }
+    }
+
+    /**
+     * @param int $id
+     * @return array|null
+     * @throws DatabaseException
+     */
+    public function getById(int $id): ?array
+    {
+        $row = $this->read(['module_storage_file_mirror.id' => $id]);
+
+        return $row['module_storage_file_mirror'] ?? null;
     }
 
     /**
