@@ -35,6 +35,12 @@ class ModuleStorageFileModel extends AbstractModel
     private const int HASH_RETRY_LIMIT = 20;
 
     /**
+     * Maximum number of records migrated by a single migrateToMirrored() call
+     * @var int
+     */
+    private const int MIGRATE_TO_MIRRORED_BATCH_LIMIT = 500;
+
+    /**
      * Active storage provider
      * @var StorageProvider
      */
@@ -225,7 +231,7 @@ class ModuleStorageFileModel extends AbstractModel
         for ($attempt = 1; $attempt <= self::HASH_RETRY_LIMIT; $attempt++) {
             $hash = $this->generateHash();
 
-            $copied = $storageInstance instanceof MinioStorage
+            $copied = $storageInstance instanceof StreamableStorageInterface
                 ? $storageInstance->copyLocalFile($source, $hash, $contentType)
                 : $this->copyLocalSourceToStorage($storageInstance, $source, $hash);
 
@@ -488,6 +494,57 @@ class ModuleStorageFileModel extends AbstractModel
     }
 
     /**
+     * Adopt existing records written under a single-provider driver ('storage' or
+     * 'minio') into mirrored storage, without moving or re-uploading a single byte.
+     *
+     * $backendId must be a module_storage_backend row describing the SAME physical
+     * location these records were originally written to (e.g. the same MinIO/S3
+     * bucket and credentials for a 'minio' migration). This method does not verify
+     * that the object is actually reachable there - it trusts the caller, consistent
+     * with the rest of this package not enforcing foreign keys between these tables.
+     * A mismatched $backendId will make the migrated records unreadable.
+     *
+     * For each matching record it registers a 'synced' mirror row (so MirroredStorage
+     * knows where to find/delete the object) and flips the record's `provider` to
+     * `mirrored`. Once migrated, adding further backends is picked up automatically
+     * the same way as any other mirrored file - see
+     * ModuleStorageFileMirrorModel::backfillCron().
+     *
+     * @param int $backendId Existing module_storage_backend row for the current location of these files.
+     * @param StorageProvider $fromProvider Only records currently on this provider are migrated.
+     * @param int $limit Max records migrated per call (batch-friendly - call again for more).
+     * @return int Number of records migrated.
+     * @throws DatabaseException
+     */
+    public function migrateToMirrored(
+        int $backendId,
+        StorageProvider $fromProvider = StorageProvider::minio,
+        int $limit = self::MIGRATE_TO_MIRRORED_BATCH_LIMIT
+    ): int {
+        $mirrorModel = ModuleStorageFileMirrorModel::make();
+
+        $records = $this->readAll(
+            ['module_storage_file.provider' => $fromProvider->value],
+            ['module_storage_file.id', 'module_storage_file.hash'],
+            'module_storage_file.id ASC',
+            (string)$limit
+        );
+
+        $migrated = 0;
+
+        foreach ($records as $record) {
+            $file = $record['module_storage_file'];
+
+            $mirrorModel->queue($file['hash'], $this->directory, $backendId, 'synced');
+            $this->setId((int)$file['id'])->update(['provider' => StorageProvider::mirrored->value]);
+
+            $migrated++;
+        }
+
+        return $migrated;
+    }
+
+    /**
      * Check whether a file exists (both in the database and in storage)
      * @param string $hash
      * @return bool
@@ -610,6 +667,7 @@ class ModuleStorageFileModel extends AbstractModel
     {
         return match ($provider) {
             StorageProvider::minio => new MinioStorage($this->directory),
+            StorageProvider::mirrored => new MirroredStorage($this->directory),
             default => new Storage($this->directory),
         };
     }

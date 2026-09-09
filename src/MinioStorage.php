@@ -9,7 +9,7 @@ use NimblePHP\Framework\Exception\NimbleException;
 use NimblePHP\Framework\Log;
 use NimblePHP\Framework\Storage;
 
-class MinioStorage extends Storage
+class MinioStorage extends Storage implements StreamableStorageInterface
 {
 
     private static array $resolvedAwsRegions = [];
@@ -23,13 +23,24 @@ class MinioStorage extends Storage
     private bool $isAws = false;
 
     /**
+     * Explicit connection settings (host/bucket/region/username/password), overriding
+     * the MINIO_* environment variables. Used by MirroredStorage so that multiple
+     * differently-configured MinIO/S3 backends can coexist, each backed by its own
+     * row in module_storage_backend instead of the single global env configuration.
+     * @var array<string, string>|null
+     */
+    private ?array $overrideConfig;
+
+    /**
      * @param string $directory
      * @param bool $securePath
+     * @param array<string, string>|null $overrideConfig
      * @throws NimbleException
      */
-    public function __construct(string $directory, bool $securePath = true)
+    public function __construct(string $directory, bool $securePath = true, ?array $overrideConfig = null)
     {
-        $this->isAws = $this->getEnvValue('MINIO_HOST') === '';
+        $this->overrideConfig = $overrideConfig;
+        $this->isAws = $this->resolveValue('MINIO_HOST', 'host') === '';
         $this->directory = trim($directory, '/');
         $this->initializeMinioClient();
 
@@ -37,12 +48,27 @@ class MinioStorage extends Storage
     }
 
     /**
+     * Resolve a connection setting from the override config if present, otherwise from env.
+     * @param string $envKey
+     * @param string $overrideKey
+     * @return string
+     */
+    private function resolveValue(string $envKey, string $overrideKey): string
+    {
+        if ($this->overrideConfig !== null) {
+            return trim((string)($this->overrideConfig[$overrideKey] ?? ''), "\"'");
+        }
+
+        return $this->getEnvValue($envKey);
+    }
+
+    /**
      * @return void
      */
     private function initializeMinioClient(): void
     {
-        $this->bucket = $this->getEnvValue('MINIO_BUCKET');
-        $configuredRegion = $this->getEnvValue('MINIO_REGION');
+        $this->bucket = $this->resolveValue('MINIO_BUCKET', 'bucket');
+        $configuredRegion = $this->resolveValue('MINIO_REGION', 'region');
         $this->s3Client = new S3Client($this->buildClientConfig($configuredRegion));
 
         if ($this->isAws) {
@@ -76,13 +102,13 @@ class MinioStorage extends Storage
             'region' => $region,
             'signature_version' => 'v4',
             'credentials' => [
-                'key' => $this->getEnvValue('MINIO_USERNAME'),
-                'secret' => $this->getEnvValue('MINIO_PASSWORD'),
+                'key' => $this->resolveValue('MINIO_USERNAME', 'username'),
+                'secret' => $this->resolveValue('MINIO_PASSWORD', 'password'),
             ],
         ];
 
         if (!$this->isAws) {
-            $config['endpoint'] = rtrim($this->getEnvValue('MINIO_HOST'), '/');
+            $config['endpoint'] = rtrim($this->resolveValue('MINIO_HOST', 'host'), '/');
             $config['use_path_style_endpoint'] = true;
         }
 
